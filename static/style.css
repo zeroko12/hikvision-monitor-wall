@@ -157,7 +157,14 @@ main { padding: 16px 20px; }
   user-select: none;
 }
 .mng-row:hover { background: var(--panel2); }
-.mng-row input { width: 16px; height: 16px; accent-color: var(--accent); }
+.mng-row input { width: 16px; height: 16px; accent-color: var(--accent); flex-shrink: 0; }
+.mng-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mng-mv {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  width: 30px; height: 30px; border-radius: 6px; cursor: pointer; font-size: 14px;
+  flex-shrink: 0; touch-action: manipulation;
+}
+.mng-mv:hover { border-color: var(--accent); }
 .manage-foot { padding: 10px 16px; border-top: 1px solid var(--border); text-align: right; }
 
 /* 手机/窄屏: 缩小卡片最小宽度, 视口内可容纳更多行 */

@@ -261,14 +261,22 @@ function attachStream(tile) {
       }, backoff);
     } else {
       poster.classList.remove("hidden");
-      poster.querySelector("span").textContent = "加载超时，点击重试";
+      poster.querySelector("span").textContent = "该路设备无响应，点击重试";
     }
   }, 12000);
 
-  const failRetry = () => {
+  // 失败原因提示: 区分"设备拒绝/无响应"与"浏览器不支持"
+  const failReason = (data) => {
+    const code = data && data.response && data.response.code;
+    if (code === 502 || code === 504) return "该路设备拒绝连接(会话满或离线)";
+    if (code === 404) return "该路通道不存在";
+    return "该路设备无响应";
+  };
+
+  const failRetry = (data) => {
     if ((tile._retries || 0) >= 3) {
       poster.classList.remove("hidden");
-      poster.querySelector("span").textContent = "加载超时，点击重试";
+      poster.querySelector("span").textContent = failReason(data) + "，点击重试";
       return;
     }
     cleanup();
@@ -291,11 +299,11 @@ function attachStream(tile) {
     hls.on(Hls.Events.ERROR, (_, data) => {
       if (!data.fatal) return;
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        failRetry();
+        failRetry(data);
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-        try { hls.recoverMediaError(); } catch (e) { failRetry(); }
+        try { hls.recoverMediaError(); } catch (e) { failRetry(data); }
       } else {
-        failRetry();
+        failRetry(data);
       }
     });
     hls.loadSource(url);
@@ -354,13 +362,39 @@ function persistOrder() {
   savePrefs();
 }
 
-// ================= 通道管理(隐藏/显示) =================
+// ================= 通道管理(隐藏/显示 + 排序) =================
+function initOrderIfNeeded() {
+  if (state.prefs.order.length) return;
+  state.prefs.order = [...$("grid").querySelectorAll(".tile")].map(t => t.dataset.id);
+  savePrefs();
+}
+
+function moveInOrder(id, dir) {
+  initOrderIfNeeded();
+  const o = state.prefs.order;
+  const i = o.indexOf(id);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= o.length) return;
+  [o[i], o[j]] = [o[j], o[i]];
+  savePrefs();
+  reorderGrid();
+  renderManage();
+}
+
+function reorderGrid() {
+  const grid = $("grid");
+  const rank = new Map(state.prefs.order.map((id, idx) => [id, idx]));
+  [...grid.querySelectorAll(".tile")]
+    .sort((a, b) => (rank.get(a.dataset.id) ?? 1e9) - (rank.get(b.dataset.id) ?? 1e9))
+    .forEach(t => grid.appendChild(t));
+}
+
 function renderManage() {
   const box = $("mng-list");
   box.innerHTML = "";
   for (const d of state.mainList) {
     const id = tileId(d);
-    const row = document.createElement("label");
+    const row = document.createElement("div");
     row.className = "mng-row";
     const cb = document.createElement("input");
     cb.type = "checkbox";
@@ -371,9 +405,20 @@ function renderManage() {
       savePrefs();
       applyVisibility(id);
     };
+    const name = document.createElement("span");
+    name.className = "mng-name";
     const st = d.status === "online" ? "" : d.status === "offline" ? " (离线)" : " (凭据失败)";
+    name.textContent = `${d.ip} · CH${d.ch} · ${d.model || ""}${st}`;
+    const up = document.createElement("button");
+    up.className = "mng-mv"; up.textContent = "↑";
+    up.title = "上移"; up.onclick = () => moveInOrder(id, -1);
+    const down = document.createElement("button");
+    down.className = "mng-mv"; down.textContent = "↓";
+    down.title = "下移"; down.onclick = () => moveInOrder(id, 1);
     row.appendChild(cb);
-    row.appendChild(document.createTextNode(` ${d.ip} · CH${d.ch} · ${d.model || ""}${st}`));
+    row.appendChild(name);
+    row.appendChild(up);
+    row.appendChild(down);
     box.appendChild(row);
   }
 }
