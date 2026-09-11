@@ -34,6 +34,14 @@ LOG_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
+
+@app.after_request
+def _no_cache_frontend(resp):
+    """前端资源禁用缓存: 升级代码后用户浏览器立即拿到新版本"""
+    if resp.mimetype in ("text/html", "application/javascript", "text/css"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
 _scanning = False
 _scan_lock = threading.Lock()
 
@@ -54,14 +62,35 @@ def get_device(ip, ch):
 
 
 class StreamManager:
-    """管理每个(ip,ch,quality)的 ffmpeg HLS 转码进程"""
+    """管理每个(ip,ch,quality)的 ffmpeg HLS 转码进程
+
+    - 启动限流: 同一时刻最多 _MAX_STARTING 个进程处于启动中,
+      避免页面首次加载时几十路同时冲击设备(导致RTSP会话占满/临时封锁)
+    - 空闲回收: last_hit 超过 IDLE_TIMEOUT 秒无请求 -> janitor 自动停流,
+      浏览器离开视口后资源自动释放
+    """
+    IDLE_TIMEOUT = 40          # 秒, 超过无任何取流请求则回收
+    START_TIMEOUT = 10         # 秒, ffmpeg 启动到产出 index.m3u8 的等待上限
+    HEALTH_SEGMENTS = 2        # 启动后需在 HEALTH_TIMEOUT 内产出的最少分片数
+    HEALTH_TIMEOUT = 12        # 秒, 达不到则判启动失败并回收
+    MAX_STARTING = 4           # 同时处于启动中的 ffmpeg 上限
 
     def __init__(self):
         self.procs = {}
         self.lock = threading.Lock()
+        self._starting = 0
+        self._start_lock = threading.Lock()
 
     def _key(self, ip, ch, quality):
         return f"{ip}_{ch}_{quality}"
+
+    def touch(self, ip, ch, quality):
+        """取流请求(playlist/segment)时刷新活跃时间"""
+        key = self._key(ip, ch, quality)
+        with self.lock:
+            p = self.procs.get(key)
+            if p and p["proc"].poll() is None:
+                p["last_hit"] = time.time()
 
     def start(self, ip, ch, quality):
         key = self._key(ip, ch, quality)
@@ -86,7 +115,10 @@ class StreamManager:
                     pass
             url = hk.get_rtsp_url(ip, chan)
             logf = open(LOG_DIR / f"{key}.log", "w", encoding="utf-8", errors="replace")
+            # 输入低延迟: 减少缓冲/探测, 加快起播并降低端到端延迟
             cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                   "-fflags", "nobuffer", "-flags", "low_delay",
+                   "-analyzeduration", "0", "-probesize", "32k",
                    "-rtsp_transport", "tcp", "-timeout", "8000000", "-i", url]
             if quality == "main":
                 # 主码流: 软编保画质(单路点看用)
@@ -99,16 +131,30 @@ class StreamManager:
                         "-b:v", "500k", "-maxrate", "700k", "-bufsize", "1000k",
                         "-r", "10", "-vf", "scale=-2:360", "-an",
                         "-g", "10", "-sc_threshold", "0"]
-            cmd += ["-f", "hls", "-hls_time", "1", "-hls_list_size", "20",
+            # 1s 分片 + 滑窗 6 片(约6秒) + temp_file(写完再改名, 避免半写文件被读到)
+            cmd += ["-f", "hls", "-hls_time", "1", "-hls_list_size", "6",
+                    "-hls_flags", "delete_segments+temp_file",
                     "-hls_segment_filename", str(outdir / "seg_%05d.ts"),
                     str(outdir / "index.m3u8")]
+            # 启动限流: 限制同时"正在拉起"的进程数(仅覆盖 Popen 阶段),
+            # 避免页面首次加载时几十路同时冲击设备(导致RTSP会话占满/临时封锁)
+            with self._start_lock:
+                while self._starting >= self.MAX_STARTING:
+                    self._start_lock.release()
+                    time.sleep(0.3)
+                    self._start_lock.acquire()
+                self._starting += 1
             try:
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL, stderr=logf,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            except Exception as e:
+            except Exception:
+                with self._start_lock:
+                    self._starting -= 1
                 logf.close()
                 return False
+            with self._start_lock:
+                self._starting -= 1
             self.procs[key] = {"proc": proc, "ip": ip, "ch": ch,
                                "quality": quality, "started": time.time(),
                                "last_hit": time.time()}
@@ -129,21 +175,41 @@ class StreamManager:
                     except Exception:
                         pass
 
+    def release(self, ip, ch, quality="sub"):
+        """浏览器离开视口/关闭弹窗时释放指定质量的转码进程"""
+        self.stop(ip, ch, quality)
+
     def purge_dead(self):
         for k in list(self.procs):
             p = self.procs[k]
             if p["proc"].poll() is not None:
                 self.procs.pop(k, None)
 
+    def idle_reclaim(self, now):
+        """回收超过 IDLE_TIMEOUT 无取流请求的进程"""
+        for k in list(self.procs):
+            p = self.procs[k]
+            if now - p["last_hit"] > self.IDLE_TIMEOUT:
+                self.procs.pop(k, None)
+                try:
+                    p["proc"].terminate()
+                    p["proc"].wait(timeout=3)
+                except Exception:
+                    try:
+                        p["proc"].kill()
+                    except Exception:
+                        pass
+
 
 sm = StreamManager()
 
 
 def janitor():
-    """定期清理过期HLS分片（未启用delete_segments，需自行回收）"""
+    """定期清理过期HLS分片 + 回收空闲转码进程(浏览器离开视口后自动停流)"""
     while True:
         try:
             now = time.time()
+            sm.idle_reclaim(now)
             for d in HLS_DIR.iterdir():
                 if not d.is_dir():
                     continue
@@ -155,7 +221,7 @@ def janitor():
                         pass
         except Exception:
             pass
-        time.sleep(20)
+        time.sleep(15)
 
 
 threading.Thread(target=janitor, daemon=True).start()
@@ -215,7 +281,8 @@ def stream_playlist(ip, ch, quality):
     outdir = HLS_DIR / key
     if not sm.start(ip, ch, quality):
         return jsonify({"error": "无法启动流(设备离线或凭据失败)"}), 502
-    deadline = time.time() + 40
+    sm.touch(ip, ch, quality)
+    deadline = time.time() + sm.START_TIMEOUT
     while time.time() < deadline:
         if (outdir / "index.m3u8").exists():
             break
@@ -227,6 +294,15 @@ def stream_playlist(ip, ch, quality):
     if not (outdir / "index.m3u8").exists():
         sm.stop(ip, ch, quality)
         return jsonify({"error": "流启动超时"}), 504
+    # 健康检查: 启动后需在 HEALTH_TIMEOUT 内产出分片, 否则判失败(设备推流异常), 避免前端无限黑屏
+    started = (sm.procs.get(key) or {}).get("started", time.time())
+    while time.time() - started < sm.HEALTH_TIMEOUT:
+        if len(list(outdir.glob("seg_*.ts"))) >= sm.HEALTH_SEGMENTS:
+            break
+        time.sleep(0.3)
+    else:
+        sm.stop(ip, ch, quality)
+        return jsonify({"error": "流启动失败(设备未推流)"}), 502
     playlist = outdir / "index.m3u8"
     content = None
     for _ in range(20):
@@ -248,6 +324,7 @@ def stream_playlist(ip, ch, quality):
 def stream_segment(ip, ch, quality, num):
     if quality not in ("main", "sub"):
         return jsonify({"error": "bad quality"}), 400
+    sm.touch(ip, ch, quality)
     key = f"{ip}_{ch}_{quality}"
     fname = f"seg_{num:05d}.ts"
     try:
@@ -255,6 +332,16 @@ def stream_segment(ip, ch, quality, num):
                                    conditional=True)
     except Exception:
         return jsonify({"error": "segment not found"}), 404
+
+
+@app.post("/api/stream/release/<ip>/<int:ch>")
+@app.post("/api/stream/release/<ip>/<int:ch>/<quality>")
+def api_stream_release(ip, ch, quality="sub"):
+    """浏览器离开视口/关闭弹窗时释放转码进程, 节省CPU与设备会话"""
+    if quality not in ("main", "sub"):
+        return jsonify({"error": "bad quality"}), 400
+    sm.release(ip, ch, quality)
+    return jsonify({"ok": True})
 
 
 @app.get("/stream/<ip>/<int:ch>/<quality>/<path:filename>")

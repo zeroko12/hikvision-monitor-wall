@@ -12,10 +12,13 @@
   <div class="stats">
     <span id="stat-total">-</span> 路画面
     <span id="stat-online" class="ok">-</span> 在线
+    <span id="stat-hidden" class="bad"></span>
     <span id="stat-failed" class="bad">-</span> 凭据失败
   </div>
   <div class="actions">
+    <span id="drag-hint" class="hint hidden">拖动卡片可排序</span>
     <span id="scanning" class="scanning hidden">扫描中…</span>
+    <button id="btn-manage" class="hidden">管理通道</button>
     <button id="btn-refresh">重新扫描设备</button>
   </div>
 </header>
@@ -34,6 +37,20 @@
   <h3 onclick="toggleSection('failed')">凭据失败的设备（需单独密码，可通过录像机通道观看）▸</h3>
   <div id="grid-failed" class="grid"></div>
 </section>
+
+<!-- 通道管理面板 -->
+<div id="manage" class="manage hidden">
+  <div class="manage-box">
+    <div class="manage-head">
+      <span>管理通道 <span class="muted">(隐藏后该通道不再取流，节省资源)</span></span>
+      <button id="mng-close">✕</button>
+    </div>
+    <div class="manage-list" id="mng-list"></div>
+    <div class="manage-foot">
+      <button id="mng-reset">恢复默认排序/全部显示</button>
+    </div>
+  </div>
+</div>
 
 <!-- 详情弹窗 -->
 <div id="modal" class="modal hidden">
