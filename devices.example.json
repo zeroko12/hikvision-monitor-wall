@@ -1,0 +1,38 @@
+{
+  "generated_at": "2026-01-01 00:00:00",
+  "count": 2,
+  "devices": [
+    {
+      "id": "192.168.8.10_1",
+      "ip": "192.168.8.10",
+      "ch": 1,
+      "src": "camera",
+      "name": "Camera-10",
+      "model": "DS-2CD3T47EWDV3-L",
+      "camera_ip": "192.168.8.10",
+      "status": "online",
+      "main": {
+        "video": {"codec": "h264", "width": 2560, "height": 1440, "fps": "25/1"},
+        "audio": false
+      },
+      "sub": {
+        "video": {"codec": "h264", "width": 640, "height": 360, "fps": "12/1"},
+        "audio": false
+      },
+      "ptz": false
+    },
+    {
+      "id": "192.168.8.20_1",
+      "ip": "192.168.8.20",
+      "ch": 1,
+      "src": "nvr",
+      "name": "大门",
+      "model": "DS-7608NXI-K2/8P",
+      "camera_ip": "192.168.8.21",
+      "status": "offline",
+      "main": null,
+      "sub": null,
+      "ptz": false
+    }
+  ]
+}

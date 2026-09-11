@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>selftest</title></head>
+<body>
+<video id="v" muted autoplay playsinline style="width:320px"></video>
+<pre id="r">running</pre>
+<script src="/static/hls.min.js"></script>
+<script>
+var v = document.getElementById('v');
+var r = document.getElementById('r');
+var logs = [];
+function L(m){ logs.push(m); r.textContent = logs.join('\n'); }
+L('hls supported: ' + Hls.isSupported());
+var hls = new Hls({ liveSyncDurationCount: 2 });
+hls.on(Hls.Events.MANIFEST_PARSED, function(){ L('manifest parsed, levels=' + hls.levels.length); v.play().catch(function(e){ L('play err: ' + e.message); }); });
+hls.on(Hls.Events.ERROR, function(_, d){ L('ERR ' + d.type + ' ' + (d.details||'') + (d.fatal?' FATAL':'')); });
+hls.on(Hls.Events.FRAG_LOADED, function(){ L('frag loaded'); });
+hls.on(Hls.Events.BUFFER_APPENDED, function(){ L('buffer appended'); });
+hls.on(Hls.Events.MEDIA_ATTACHED, function(){ L('media attached'); });
+fetch('/api/devices').then(function(res){ return res.json(); }).then(function(data){
+  var d = (data.devices||[]).find(function(x){ return x.status === 'online'; });
+  var url = d ? ('/stream/' + d.ip + '/' + d.ch + '/sub/live') : null;
+  if (!url) { L('no online device'); return; }
+  L('loading: ' + url);
+  hls.loadSource(url);
+  hls.attachMedia(v);
+}).catch(function(e){ L('fetch err: ' + e.message); });
+var iv = setInterval(function(){
+  L('POLL rs=' + v.readyState + ' t=' + v.currentTime.toFixed(1) + ' size=' + v.videoWidth + 'x' + v.videoHeight + ' paused=' + v.paused + ' hlsState=' + hls.state);
+}, 3000);
+setTimeout(function(){ clearInterval(iv); L('DONE'); }, 24000);
+</script>
+</body>
+</html>

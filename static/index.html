@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>海康威视监控墙</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">📹 海康威视监控墙 <span class="sub">hikvision-monitor-wall</span></div>
+  <div class="stats">
+    <span id="stat-total">-</span> 路画面
+    <span id="stat-online" class="ok">-</span> 在线
+    <span id="stat-failed" class="bad">-</span> 凭据失败
+  </div>
+  <div class="actions">
+    <span id="scanning" class="scanning hidden">扫描中…</span>
+    <button id="btn-refresh">重新扫描设备</button>
+  </div>
+</header>
+
+<main>
+  <div id="grid" class="grid"></div>
+  <div id="empty" class="empty hidden">未发现可用设备，点击右上角"重新扫描设备"</div>
+</main>
+
+<section id="duplicate-section" class="extra-section hidden">
+  <h3 onclick="toggleSection('duplicate')">录像机备用通道（与直连画面相同，冗余用）▸</h3>
+  <div id="grid-duplicate" class="grid"></div>
+</section>
+
+<section id="failed-section" class="extra-section hidden">
+  <h3 onclick="toggleSection('failed')">凭据失败的设备（需单独密码，可通过录像机通道观看）▸</h3>
+  <div id="grid-failed" class="grid"></div>
+</section>
+
+<!-- 详情弹窗 -->
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span id="modal-title"></span>
+      <div class="modal-btns">
+        <button id="m-main">主码流</button>
+        <button id="m-sub" class="active">子码流</button>
+        <button id="m-snap">抓拍</button>
+        <button id="m-full">全屏</button>
+        <button id="m-close">✕</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <div class="video-wrap">
+        <video id="modal-video" controls playsinline muted></video>
+        <div id="modal-ptz" class="ptz hidden">
+          <div class="ptz-pad">
+            <button data-cmd="up-left">↖</button><button data-cmd="up">↑</button><button data-cmd="up-right">↗</button>
+            <button data-cmd="left">←</button><button data-cmd="home">⏺</button><button data-cmd="right">→</button>
+            <button data-cmd="down-left">↙</button><button data-cmd="down">↓</button><button data-cmd="down-right">↘</button>
+          </div>
+          <div class="ptz-zoom">
+            <button data-cmd="zoomin">＋</button>
+            <button data-cmd="zoomstop">停止</button>
+            <button data-cmd="zoomout">－</button>
+          </div>
+        </div>
+        <div id="snapshot-wrap" class="snapshot hidden">
+          <img id="snapshot-img" alt="snapshot">
+          <a id="snapshot-link" download="snapshot.jpg">保存图片</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/hls.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

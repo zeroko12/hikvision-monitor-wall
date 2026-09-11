@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行时生成
+hls/
+logs/
+snapshots/
+samples/
+devices.json
+
+# 本机专用配置(不要入库)
+python_env.bat
+
+# IDE
+.idea/
+.vscode/
+*.swp
