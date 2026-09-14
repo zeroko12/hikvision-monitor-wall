@@ -10,6 +10,8 @@ const state = {
   prefs: loadPrefs(),
   io: null,
   ioFallback: false,
+  attachQueue: [],       // 前端并发闸: 待起流队列(与后端MAX_STARTING=6对齐)
+  attachingCount: 0,     // 正在起流中的新流数量
 };
 
 const $ = (id) => document.getElementById(id);
@@ -111,7 +113,20 @@ function makeTile(d, lazy) {
       <span class="dot ${d.status === "online" ? "live" :
             d.status === "auth_failed" ? "off" : "dead"}"></span>
     </div>`;
-  t.addEventListener("click", () => openModal(d));
+  t.addEventListener("click", () => {
+    // 播放被浏览器策略暂停/重试额度耗尽时, 点击立即恢复(用户手势可解锁自动播放)
+    const v = t.querySelector("video");
+    if (v && v.paused && t._attached) {
+      t._retries = 0;
+      v.play().catch(() => {
+        t._retries = 0; t._attached = false; attachStream(t);
+      });
+    } else if (t._attached && (t._retries || 0) >= 3) {
+      t._retries = 0; t._attached = false; attachStream(t);
+    } else {
+      openModal(d);
+    }
+  });
   if (lazy && d.status === "online") observeTile(t, d);
   return t;
 }
@@ -185,17 +200,26 @@ function scheduleFallback() {
 function resumeViewportStaggered() {
   const vh = window.innerHeight || document.documentElement.clientHeight;
   const tiles = [...document.querySelectorAll("#grid .tile")].filter(t => {
-    if (!t._dev || t._attached || t.dataset.online !== "1") return false;
+    if (!t._dev || t.dataset.online !== "1") return false;
     const r = t.getBoundingClientRect();
     return r.bottom > -400 && r.top < vh + 400;
   });
+  // 回前台: 卡在"离线"终态的强制重置重试(锁屏/切后台期间重试额度被耗尽, 恢复正常播放)
+  tiles.forEach(t => {
+    if (t._attached && (t._retries || 0) >= 3) {
+      t._retries = 0;
+      t._attached = false;
+      attachStream(t);
+    }
+  });
+  const need = tiles.filter(t => !t._attached);
   let i = 0;
   const step = () => {
-    if (i >= tiles.length) return;
-    attachStream(tiles[i++]);
+    if (i >= need.length) return;
+    attachStream(need[i++]);
     setTimeout(step, 700);   // 每700ms起一路, 14路约10秒铺满, 设备端可承受
   };
-  if (tiles.length) step();
+  if (need.length) step();
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -260,6 +284,12 @@ function onFirstFrame(tile, fn) {
 
 // 离开视口: 定格最后一帧 + 保留热流60秒(滚动返回秒开), 超时未返回才销毁并释放
 function detachStream(tile, immediate) {
+  // 排队中(前端并发闸)的流: 直接移出队列
+  if (tile._queued) {
+    tile._queued = false;
+    state.attachQueue = state.attachQueue.filter(x => x !== tile);
+    return;
+  }
   if (!tile._attached) return;
   tile._attached = false;
   tile._retries = 0;
@@ -301,9 +331,40 @@ const HLS_CFG = {
   fragLoadingMaxRetry: 3,
 };
 
+// 前端并发闸: 与后端MAX_STARTING=6对齐, 最多同时起6路新流, 其余排队等待.
+// 避免几十路同时attach → 后端限流排队 → 前端全部超时显示"重连中".
+const MAX_ATTACH = 6;
+function startNextAttach() {
+  while (state.attachingCount < MAX_ATTACH && state.attachQueue.length) {
+    const t = state.attachQueue.shift();
+    t._queued = false;
+    if (!t._attached && t._dev) doAttachStream(t);
+  }
+}
 function attachStream(tile) {
   if (tile._attached) return;
+  // 热流恢复(已有实例)不走闸, 直接秒开
+  const kept = state.hls.get(tile.dataset.id);
+  if (kept && !kept.destroyed) { tile._tookSlot = false; doAttachStream(tile); return; }
+  if (state.attachingCount >= MAX_ATTACH) {
+    if (!tile._queued) { tile._queued = true; state.attachQueue.push(tile); setTileState(tile, "loading"); }
+    return;
+  }
+  state.attachingCount++;
+  tile._tookSlot = true;
+  doAttachStream(tile);
+}
+
+function doAttachStream(tile) {
+  if (tile._attached) return;
   tile._attached = true;
+  tile._lastFragAt = 0;   // 分片心跳, 看门狗据此区分"慢"与"死"
+  const releaseSlot = () => {
+    if (!tile._tookSlot) return;
+    tile._tookSlot = false;
+    if (state.attachingCount > 0) state.attachingCount--;
+    startNextAttach();
+  };
   const dev = tile._dev;
   const video = tile.querySelector("video");
   const poster = tile.querySelector(".poster");
@@ -319,32 +380,50 @@ function attachStream(tile) {
     clearTimeout(tile._timeout);
   };
 
-  // 播放看门狗: 每3秒核对一次 currentTime 是否在走, 驱动"实时/重连中/离线"角标,
-  // 并触发重建. 只在本attach会话真正出过画面(started)后才计数, 避免误杀启动期.
+  // 播放看门狗: 每3秒核对一次 currentTime 是否在走, 驱动"实时/重连中/离线"角标.
+  // 重建判据(区分"慢"与"死"):
+  //  - MSE路径(hls.js): 分片心跳 fragAlive 权威——分片还在加载=后端在干活, 温和等待绝不重建
+  //  - 原生路径(iPhone Safari等): 无分片心跳, 用 readyState——缓冲等待(<2)温和等待,
+  //    只有"有缓冲却不动"(>=2)才是真死 → 重建
+  // 避免: ①后端MAX_STARTING限流下排队流被误杀→重建风暴 ②原生播放器缓冲间隙被误判
+  // 只在本attach会话真正出过画面(started)后才计数, 避免误杀启动期.
   let lastTime = -1, stallCount = 0, started = false;
   const markStarted = () => { started = true; };
+  const isNative = () => !hls;   // 原生HLS路径没有hls.js实例
   const stallWatch = () => {
     tile._stallTimer = setTimeout(() => {
       if (!tile._attached) { stallWatch(); return; }
       if (!started || !video.currentTime) { stallWatch(); return; }
-      // 只要 currentTime 没动就算停滞(readyState高低都算), 避免缓冲耗尽漏判
-      const stalled = video.paused || Math.abs(video.currentTime - lastTime) < 0.001;
-      if (stalled) {
-        stallCount++;
+      const moving = Math.abs(video.currentTime - lastTime) >= 0.001;
+      const fragAlive = (Date.now() - (tile._lastFragAt || 0)) < 10000;  // 10秒内有分片加载
+      const buffering = video.readyState < 2;   // 正在等缓冲数据
+      if (moving) {
+        stallCount = 0;
+        setTileState(tile, "live");   // currentTime 在走 = 真实时, 角标实时校正
+      } else {
         setTileState(tile, tile._retries >= 3 ? "off" : "retry");
-        if (stallCount >= 2 && tile._retries < 3) {
+        if (video.paused) {
+          // 播放被浏览器策略暂停: 尝试恢复, 连续3拍仍暂停才重建
+          video.play().catch(() => {});
+          stallCount++;
+        } else if (isNative() && buffering) {
+          stallCount = 0;   // 原生播放器在等缓冲: 温和等待
+        } else if (!fragAlive) {
+          stallCount++;     // 真死: 视频停 + (MSE)无分片 或 (原生)有缓冲却不动
+        } else {
+          stallCount = 0;   // 分片还在加载(后端慢/排队): 温和等待
+        }
+        if (stallCount >= 3 && tile._retries < 3) {
           tile._retries++;
           stallCount = 0;
           cleanup();
+          releaseSlot();   // 让出并发位, 1.5秒后重建重新占位
           setTimeout(() => {
             tile._attached = false;   // 关键: 先释放占用标记, 重连才会真正执行
             if (tile._dev) attachStream(tile);
           }, 1500);
           return;
         }
-      } else {
-        stallCount = 0;
-        setTileState(tile, "live");   // currentTime 在走 = 真实时, 角标实时校正
       }
       lastTime = video.currentTime;
       stallWatch();
@@ -374,12 +453,14 @@ function attachStream(tile) {
       setTileState(tile, "off");
       if (tile._snapUrl) { showSnap(tile); setDot(tile, false); }
       else showPoster(finalMsg);
+      releaseSlot();
       return;
     }
     if (!force && (video.videoWidth > 0 || video.readyState >= 2)) {
       poster.classList.add("hidden");
       hideSnap(tile);
       setTileState(tile, "live");
+      releaseSlot();
       return;
     }
     // 重试期间: 有定格帧就顶着(角标"重连中"), 新画面出来才替换
@@ -387,6 +468,7 @@ function attachStream(tile) {
     if (tile._snapUrl) showSnap(tile);
     else showPoster("加载中…自动重试");
     cleanup();
+    releaseSlot();
     const backoff = [2000, 5000, 10000][Math.min(rt, 2)];
     setTimeout(() => {
       tile._retries = (tile._retries || 0) + 1;
@@ -395,17 +477,20 @@ function attachStream(tile) {
     }, backoff);
   };
 
-  // 加载超时: 12秒无画面则提示并自动重试
+  // 加载超时: 18秒无画面则提示并自动重试(给后端启动限流排队留足时间)
   tile._timeout = setTimeout(() => {
     if (video.videoWidth > 0 || video.readyState > 0) {
       poster.classList.add("hidden");
       hideSnap(tile);
+      releaseSlot();
       return;
     }
     retryStream("该路设备无响应，点击重试", false);
-  }, 12000);
+  }, 18000);
 
   const bindErrors = (h) => {
+    // 分片心跳: 每次成功加载分片都刷新时间戳, 看门狗据此区分"慢"与"死"
+    h.on(Hls.Events.FRAG_LOADED, () => { tile._lastFragAt = Date.now(); });
     h.on(Hls.Events.ERROR, (_, data) => {
       if (!data.fatal) return;
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
@@ -426,6 +511,7 @@ function attachStream(tile) {
     poster.classList.add("hidden");
     hls = kept;
     try { hls.startLoad(); } catch (e) { retryStream("该路设备无响应，点击重试", true); return; }
+    tile._lastFragAt = Date.now();   // 热流恢复后给足缓冲期, 不因拉流间隙误判
     onFirstFrame(tile, () => { hideSnap(tile); setDot(tile, true); });
     markStarted();
     video.play().catch(() => {});
@@ -443,6 +529,7 @@ function attachStream(tile) {
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       poster.classList.add("hidden");
       markStarted();
+      releaseSlot();   // 流已起来, 让出并发位给排队流
       onFirstFrame(tile, () => { hideSnap(tile); setDot(tile, true); });
       video.play().catch(() => {});
       lastTime = video.currentTime || 0;
@@ -457,6 +544,7 @@ function attachStream(tile) {
     video.addEventListener("loadedmetadata", () => {
       poster.classList.add("hidden");
       markStarted();
+      releaseSlot();   // 流已起来, 让出并发位给排队流
       onFirstFrame(tile, () => { hideSnap(tile); setDot(tile, true); });
       video.play().catch(() => {});
       lastTime = video.currentTime || 0;
@@ -465,6 +553,7 @@ function attachStream(tile) {
   } else {
     poster.classList.remove("hidden");
     poster.querySelector("span").textContent = "浏览器不支持播放，请用Chrome/Edge";
+    releaseSlot();
   }
 }
 
