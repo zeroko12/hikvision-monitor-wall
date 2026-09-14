@@ -72,6 +72,19 @@ main { padding: 16px 20px; }
   position: absolute; inset: 0; background: #000 no-repeat center / cover;
   z-index: 2;
 }
+/* 状态角标: 实时/定格/重连中/加载中/离线 */
+.tile-state {
+  position: absolute; top: 6px; left: 6px; z-index: 3;
+  font-size: 10px; line-height: 1; padding: 3px 6px; border-radius: 4px;
+  font-weight: 600; letter-spacing: .5px;
+  background: rgba(10,14,20,.72); border: 1px solid rgba(255,255,255,.16);
+  backdrop-filter: blur(2px);
+}
+.tile-state.live { color: #4ade80; border-color: rgba(74,222,128,.5); }
+.tile-state.frozen { color: #94a3b8; }
+.tile-state.retry { color: #fbbf24; border-color: rgba(251,191,36,.5); }
+.tile-state.loading { color: #60a5fa; }
+.tile-state.off { color: #f87171; border-color: rgba(248,113,113,.5); }
 .tile .poster .big { font-size: 30px; opacity: .5; }
 .tile.no-signal video { display: none; }
 

@@ -100,6 +100,7 @@ function makeTile(d, lazy) {
   t.innerHTML = `
     <video muted playsinline preload="none"></video>
     <div class="snap hidden"></div>
+    <span class="tile-state ${d.status === "online" ? "loading" : "off"}">${d.status === "online" ? "加载中" : "离线"}</span>
     <div class="poster hidden">
       <span class="big">${d.status === "auth_failed" ? "🔒" : "📡"}</span>
       <span>${d.status === "auth_failed" ? "凭据失败(需单独密码)" :
@@ -234,6 +235,26 @@ function setDot(tile, live) {
   dot.classList.toggle("dead", !live);
 }
 
+// 状态角标: live实时 / frozen定格 / retry重连中 / loading加载中 / off离线
+const STATE_TEXT = { live: "实时", frozen: "定格", retry: "重连中", loading: "加载中", off: "离线" };
+function setTileState(tile, s) {
+  const el = tile.querySelector(".tile-state");
+  if (!el) return;
+  el.className = "tile-state " + s;
+  el.textContent = STATE_TEXT[s] || s;
+}
+
+// 帧真正渲染出来才切换定格→实时(比play()更早更准)
+function onFirstFrame(tile, fn) {
+  const video = tile.querySelector("video");
+  if (!video) { fn(); return; }
+  let done = false;
+  const go = () => { if (done) return; done = true; video.removeEventListener("playing", go); fn(); };
+  video.addEventListener("playing", go);
+  // 兜底: 2秒内没有playing事件也照常切换(避免漏掉)
+  setTimeout(go, 2000);
+}
+
 // 离开视口: 定格最后一帧 + 保留热流60秒(滚动返回秒开), 超时未返回才销毁并释放
 function detachStream(tile, immediate) {
   if (!tile._attached) return;
@@ -245,6 +266,7 @@ function detachStream(tile, immediate) {
   clearTimeout(tile._stallTimer);
   clearTimeout(tile._timeout);
   captureFrame(tile);
+  setTileState(tile, "frozen");
   if (h && !h.destroyed && !immediate) {
     try { h.stopLoad(); } catch (e) {}
     try { video.pause(); } catch (e) {}
@@ -342,7 +364,8 @@ function attachStream(tile) {
   const retryStream = (finalMsg, force) => {
     const rt = tile._retries || 0;
     if (rt >= 3) {
-      // 终态: 有定格帧则保持定格(不遮黑, 状态点变灰), 否则显示失败文案
+      // 终态: 有定格帧则保持定格(状态点变灰+角标离线), 否则显示失败文案
+      setTileState(tile, "off");
       if (tile._snapUrl) { showSnap(tile); setDot(tile, false); }
       else showPoster(finalMsg);
       return;
@@ -350,9 +373,11 @@ function attachStream(tile) {
     if (!force && (video.videoWidth > 0 || video.readyState >= 2)) {
       poster.classList.add("hidden");
       hideSnap(tile);
+      setTileState(tile, "live");
       return;
     }
-    // 重试期间: 有定格帧就顶着(不闪"加载中"), 新画面出来才替换
+    // 重试期间: 有定格帧就顶着(角标"重连中"), 新画面出来才替换
+    setTileState(tile, "retry");
     if (tile._snapUrl) showSnap(tile);
     else showPoster("加载中…自动重试");
     cleanup();
@@ -395,22 +420,22 @@ function attachStream(tile) {
     poster.classList.add("hidden");
     hls = kept;
     try { hls.startLoad(); } catch (e) { retryStream("该路设备无响应，点击重试", true); return; }
-    video.play().then(() => { hideSnap(tile); setDot(tile, true); }).catch(() => {});
+    onFirstFrame(tile, () => { hideSnap(tile); setTileState(tile, "live"); setDot(tile, true); });
+    video.play().catch(() => {});
     lastTime = video.currentTime || 0;
     stallWatch();
     return;
   }
 
   // 重建期间: 有定格帧则垫底, 新画面出来才替换(全程不黑屏)
-  if (tile._snapUrl) showSnap(tile);
+  if (tile._snapUrl) { showSnap(tile); setTileState(tile, "retry"); }
 
   if (Hls.isSupported() && !(isApple && canNative)) {
     hls = new Hls(HLS_CFG);
     state.hls.set(id, hls);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       poster.classList.add("hidden");
-      hideSnap(tile);
-      setDot(tile, true);
+      onFirstFrame(tile, () => { hideSnap(tile); setTileState(tile, "live"); setDot(tile, true); });
       video.play().catch(() => {});
       lastTime = video.currentTime || 0;
       stallWatch();
@@ -423,8 +448,7 @@ function attachStream(tile) {
     video.load();
     video.addEventListener("loadedmetadata", () => {
       poster.classList.add("hidden");
-      hideSnap(tile);
-      setDot(tile, true);
+      onFirstFrame(tile, () => { hideSnap(tile); setTileState(tile, "live"); setDot(tile, true); });
       video.play().catch(() => {});
       lastTime = video.currentTime || 0;
       stallWatch();
