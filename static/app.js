@@ -251,8 +251,11 @@ function onFirstFrame(tile, fn) {
   let done = false;
   const go = () => { if (done) return; done = true; video.removeEventListener("playing", go); fn(); };
   video.addEventListener("playing", go);
-  // 兜底: 2秒内没有playing事件也照常切换(避免漏掉)
-  setTimeout(go, 2000);
+  // 兜底: 2秒内没有playing事件, 只要有解码画面就切换(避免漏掉);
+  // 完全没解码(黑屏)则不切, 定格帧继续垫底, 由看门狗决定重连
+  setTimeout(() => {
+    if (video.videoWidth > 0) go();
+  }, 2000);
 }
 
 // 离开视口: 定格最后一帧 + 保留热流60秒(滚动返回秒开), 超时未返回才销毁并释放
@@ -316,17 +319,19 @@ function attachStream(tile) {
     clearTimeout(tile._timeout);
   };
 
-  // 卡住检测: 画面停滞超过5秒则强制重建
-  let lastTime = -1, stallCount = 0;
+  // 播放看门狗: 每3秒核对一次 currentTime 是否在走, 驱动"实时/重连中/离线"角标,
+  // 并触发重建. 只在本attach会话真正出过画面(started)后才计数, 避免误杀启动期.
+  let lastTime = -1, stallCount = 0, started = false;
+  const markStarted = () => { started = true; };
   const stallWatch = () => {
     tile._stallTimer = setTimeout(() => {
-      if (!tile._attached || !video.currentTime) { stallWatch(); return; }
-      // 已attach却暂停/画面停滞(流可能已死) → 计入停滞, 累计2次强制重建
-      const stalled = video.paused ||
-        (!video.paused && video.readyState >= 2 &&
-         Math.abs(video.currentTime - lastTime) < 0.001);
+      if (!tile._attached) { stallWatch(); return; }
+      if (!started || !video.currentTime) { stallWatch(); return; }
+      // 只要 currentTime 没动就算停滞(readyState高低都算), 避免缓冲耗尽漏判
+      const stalled = video.paused || Math.abs(video.currentTime - lastTime) < 0.001;
       if (stalled) {
         stallCount++;
+        setTileState(tile, tile._retries >= 3 ? "off" : "retry");
         if (stallCount >= 2 && tile._retries < 3) {
           tile._retries++;
           stallCount = 0;
@@ -339,6 +344,7 @@ function attachStream(tile) {
         }
       } else {
         stallCount = 0;
+        setTileState(tile, "live");   // currentTime 在走 = 真实时, 角标实时校正
       }
       lastTime = video.currentTime;
       stallWatch();
@@ -420,7 +426,8 @@ function attachStream(tile) {
     poster.classList.add("hidden");
     hls = kept;
     try { hls.startLoad(); } catch (e) { retryStream("该路设备无响应，点击重试", true); return; }
-    onFirstFrame(tile, () => { hideSnap(tile); setTileState(tile, "live"); setDot(tile, true); });
+    onFirstFrame(tile, () => { hideSnap(tile); setDot(tile, true); });
+    markStarted();
     video.play().catch(() => {});
     lastTime = video.currentTime || 0;
     stallWatch();
@@ -435,7 +442,8 @@ function attachStream(tile) {
     state.hls.set(id, hls);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       poster.classList.add("hidden");
-      onFirstFrame(tile, () => { hideSnap(tile); setTileState(tile, "live"); setDot(tile, true); });
+      markStarted();
+      onFirstFrame(tile, () => { hideSnap(tile); setDot(tile, true); });
       video.play().catch(() => {});
       lastTime = video.currentTime || 0;
       stallWatch();
@@ -448,7 +456,8 @@ function attachStream(tile) {
     video.load();
     video.addEventListener("loadedmetadata", () => {
       poster.classList.add("hidden");
-      onFirstFrame(tile, () => { hideSnap(tile); setTileState(tile, "live"); setDot(tile, true); });
+      markStarted();
+      onFirstFrame(tile, () => { hideSnap(tile); setDot(tile, true); });
       video.play().catch(() => {});
       lastTime = video.currentTime || 0;
       stallWatch();
