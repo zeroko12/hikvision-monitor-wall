@@ -178,19 +178,30 @@ function scheduleFallback() {
   attachTimer = setTimeout(() => { attachTimer = null; fallbackScan(); }, 150);
 }
 
-// 离开视口: 销毁播放器并通知后端释放转码进程(子码流)
-function detachStream(tile) {
+// 离开视口: 保留热流15秒(滚动返回秒开), 超时未返回才销毁并释放后端转码
+function detachStream(tile, immediate) {
   if (!tile._attached) return;
   tile._attached = false;
   tile._retries = 0;
   const id = tile.dataset.id;
-  const h = state.hls.get(id);
-  if (h) { try { h.destroy(); } catch (e) {} state.hls.delete(id); }
   const video = tile.querySelector("video");
-  if (video) { video.removeAttribute("src"); video.load(); }
+  const h = state.hls.get(id);
   clearTimeout(tile._stallTimer);
   clearTimeout(tile._timeout);
-  fetch(`/api/stream/release/${tile.dataset.ip}/${tile.dataset.ch}`, { method: "POST" }).catch(() => {});
+  if (h && !h.destroyed && !immediate) {
+    try { h.stopLoad(); } catch (e) {}
+    try { video.pause(); } catch (e) {}
+    tile._releaseTimer = setTimeout(() => {
+      const hh = state.hls.get(id);
+      if (hh) { try { hh.destroy(); } catch (e) {} state.hls.delete(id); }
+      if (video) { video.removeAttribute("src"); video.load(); }
+      fetch(`/api/stream/release/${tile.dataset.ip}/${tile.dataset.ch}`, { method: "POST" }).catch(() => {});
+    }, 15000);
+  } else {
+    if (h) { try { h.destroy(); } catch (e) {} state.hls.delete(id); }
+    if (video) { video.removeAttribute("src"); video.load(); }
+    fetch(`/api/stream/release/${tile.dataset.ip}/${tile.dataset.ch}`, { method: "POST" }).catch(() => {});
+  }
 }
 
 // hls.js 低延迟/容错配置
@@ -213,12 +224,14 @@ function attachStream(tile) {
   const dev = tile._dev;
   const video = tile.querySelector("video");
   const poster = tile.querySelector(".poster");
+  const id = tile.dataset.id;
   const url = `/stream/${dev.ip}/${dev.ch}/sub/live`;
   const canNative = video.canPlayType("application/vnd.apple.mpegurl");
   const isApple = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent);
   let hls = null;
   const cleanup = () => {
     if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+    state.hls.delete(id);
     clearTimeout(tile._stallTimer);
     clearTimeout(tile._timeout);
   };
@@ -228,14 +241,20 @@ function attachStream(tile) {
   const stallWatch = () => {
     tile._stallTimer = setTimeout(() => {
       if (!tile._attached || !video.currentTime) { stallWatch(); return; }
-      if (!video.paused && video.readyState >= 2 &&
-          Math.abs(video.currentTime - lastTime) < 0.001) {
+      // 已attach却暂停/画面停滞(流可能已死) → 计入停滞, 累计2次强制重建
+      const stalled = video.paused ||
+        (!video.paused && video.readyState >= 2 &&
+         Math.abs(video.currentTime - lastTime) < 0.001);
+      if (stalled) {
         stallCount++;
         if (stallCount >= 2 && tile._retries < 3) {
           tile._retries++;
           stallCount = 0;
           cleanup();
-          setTimeout(() => { if (tile._attached) attachStream(tile); }, 1500);
+          setTimeout(() => {
+            tile._attached = false;   // 关键: 先释放占用标记, 重连才会真正执行
+            if (tile._dev) attachStream(tile);
+          }, 1500);
           return;
         }
       } else {
@@ -246,25 +265,6 @@ function attachStream(tile) {
     }, 3000);
   };
 
-  // 加载超时: 12秒无画面则提示并自动重试(最多3次, 指数退避)
-  const tryCount = tile._retries || 0;
-  tile._timeout = setTimeout(() => {
-    if (video.readyState > 0 || video.videoWidth > 0) return;
-    if (tryCount < 3) {
-      poster.classList.remove("hidden");
-      poster.querySelector("span").textContent = "加载中…自动重试";
-      cleanup();
-      const backoff = [2000, 4000, 8000][Math.min(tryCount, 2)];
-      setTimeout(() => {
-        tile._retries = (tile._retries || 0) + 1;
-        if (tile._attached) attachStream(tile);
-      }, backoff);
-    } else {
-      poster.classList.remove("hidden");
-      poster.querySelector("span").textContent = "该路设备无响应，点击重试";
-    }
-  }, 12000);
-
   // 失败原因提示: 区分"设备拒绝/无响应"与"浏览器不支持"
   const failReason = (data) => {
     const code = data && data.response && data.response.code;
@@ -273,39 +273,75 @@ function attachStream(tile) {
     return "该路设备无响应";
   };
 
-  const failRetry = (data) => {
-    if ((tile._retries || 0) >= 3) {
-      poster.classList.remove("hidden");
-      poster.querySelector("span").textContent = failReason(data) + "，点击重试";
+  const showPoster = (msg) => {
+    poster.classList.remove("hidden");
+    poster.querySelector("span").textContent = msg;
+  };
+
+  // 统一重试入口: 已有画面则直接恢复, 否则按退避重连(最多3次)
+  const retryStream = (finalMsg) => {
+    const rt = tile._retries || 0;
+    if (rt >= 3) { showPoster(finalMsg); return; }
+    if (video.videoWidth > 0 || video.readyState >= 2) {
+      poster.classList.add("hidden");
       return;
     }
+    showPoster("加载中…自动重试");
     cleanup();
-    const backoff = [2000, 4000, 8000][Math.min(tile._retries || 0, 2)];
+    const backoff = [2000, 4000, 8000][Math.min(rt, 2)];
     setTimeout(() => {
       tile._retries = (tile._retries || 0) + 1;
-      if (tile._attached) attachStream(tile);
+      tile._attached = false;   // 关键: 释放占用标记后才能真正重连
+      if (tile._dev) attachStream(tile);
     }, backoff);
   };
 
+  // 加载超时: 12秒无画面则提示并自动重试
+  tile._timeout = setTimeout(() => {
+    if (video.videoWidth > 0 || video.readyState > 0) {
+      poster.classList.add("hidden");
+      return;
+    }
+    retryStream("该路设备无响应，点击重试");
+  }, 12000);
+
+  const bindErrors = (h) => {
+    h.on(Hls.Events.ERROR, (_, data) => {
+      if (!data.fatal) return;
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        retryStream(failReason(data) + "，点击重试");
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        try { h.recoverMediaError(); } catch (e) { retryStream(failReason(data) + "，点击重试"); }
+      } else {
+        retryStream(failReason(data) + "，点击重试");
+      }
+    });
+  };
+
+  // ===== 热流恢复: 刚离开视口(15秒内)保留的实例直接续播, 秒开 =====
+  const kept = state.hls.get(id);
+  if (kept && !kept.destroyed) {
+    clearTimeout(tile._releaseTimer);
+    tile._releaseTimer = null;
+    poster.classList.add("hidden");
+    hls = kept;
+    try { hls.startLoad(); } catch (e) { failRetry(); return; }
+    video.play().catch(() => {});
+    lastTime = video.currentTime || 0;
+    stallWatch();
+    return;
+  }
+
   if (Hls.isSupported() && !(isApple && canNative)) {
     hls = new Hls(HLS_CFG);
-    state.hls.set(tileId(dev), hls);
+    state.hls.set(id, hls);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       poster.classList.add("hidden");
       video.play().catch(() => {});
       lastTime = video.currentTime || 0;
       stallWatch();
     });
-    hls.on(Hls.Events.ERROR, (_, data) => {
-      if (!data.fatal) return;
-      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        failRetry(data);
-      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-        try { hls.recoverMediaError(); } catch (e) { failRetry(data); }
-      } else {
-        failRetry(data);
-      }
-    });
+    bindErrors(hls);
     hls.loadSource(url);
     hls.attachMedia(video);
   } else if (canNative) {
@@ -428,7 +464,7 @@ function applyVisibility(id) {
   const grid = $("grid");
   const hidden = !!state.prefs.hidden[id];
   const tile = grid.querySelector(`.tile[data-id="${CSS.escape(id)}"]`);
-  if (hidden && tile) { detachStream(tile); tile.remove(); }
+  if (hidden && tile) { detachStream(tile, true); tile.remove(); }
   if (!hidden && !tile) {
     const d = state.mainList.find(x => tileId(x) === id);
     if (d) grid.appendChild(makeTile(d, true));
@@ -452,7 +488,7 @@ $("mng-reset").onclick = () => {
   savePrefs();
   // 停掉全部主网格流并整体重建
   const grid = $("grid");
-  for (const t of [...grid.querySelectorAll(".tile")]) detachStream(t);
+  for (const t of [...grid.querySelectorAll(".tile")]) detachStream(t, true);
   loadDevices();
   $("manage").classList.add("hidden");
 };
@@ -564,7 +600,7 @@ $("btn-refresh").onclick = async () => {
 };
 
 function stopAllHls() {
-  for (const t of document.querySelectorAll("#grid .tile")) detachStream(t);
+  for (const t of document.querySelectorAll("#grid .tile")) detachStream(t, true);
   state.hls.forEach(h => { try { h.destroy(); } catch (e) {} });
   state.hls.clear();
 }
