@@ -73,7 +73,7 @@ class StreamManager:
     START_TIMEOUT = 10         # 秒, ffmpeg 启动到产出 index.m3u8 的等待上限
     HEALTH_SEGMENTS = 2        # 启动后需在 HEALTH_TIMEOUT 内产出的最少分片数
     HEALTH_TIMEOUT = 12        # 秒, 达不到则判启动失败并回收
-    MAX_STARTING = 6           # 同时处于启动中的 ffmpeg 上限
+    MAX_STARTING = 10          # 同时处于启动中的 ffmpeg 上限(16路QSV并发实测无压力, 留余量)
 
     def __init__(self):
         self.procs = {}

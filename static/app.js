@@ -331,9 +331,9 @@ const HLS_CFG = {
   fragLoadingMaxRetry: 3,
 };
 
-// 前端并发闸: 与后端MAX_STARTING=6对齐, 最多同时起6路新流, 其余排队等待.
-// 避免几十路同时attach → 后端限流排队 → 前端全部超时显示"重连中".
-const MAX_ATTACH = 6;
+// 前端并发闸: 与后端MAX_STARTING=10对齐, 最多同时起16路新流(一屏上限), 其余排队等待.
+// 避免几十路同时attach → 浏览器/网络压力与后端排队叠加.
+const MAX_ATTACH = 16;
 function startNextAttach() {
   while (state.attachingCount < MAX_ATTACH && state.attachQueue.length) {
     const t = state.attachQueue.shift();

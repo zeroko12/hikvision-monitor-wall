@@ -26,5 +26,5 @@ SDK_PORT = int(os.environ.get("HK_SDK_PORT", 8000))
 # ---- 服务运行 ----
 # 监控墙 HTTP 服务监听端口
 SERVER_PORT = int(os.environ.get("HK_SERVER_PORT", 5000))
-# waitress 线程数（同时访问的人多可调大）
-SERVER_THREADS = int(os.environ.get("HK_SERVER_THREADS", 8))
+# waitress 线程数(一屏16路流 × 每路约2请求/秒 ≈ 32req/s 峰值, 24线程覆盖)
+SERVER_THREADS = int(os.environ.get("HK_SERVER_THREADS", 24))
