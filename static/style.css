@@ -67,6 +67,11 @@ main { padding: 16px 20px; }
   align-items: center; justify-content: center; gap: 8px;
   background: #0a0e14; color: var(--muted); font-size: 14px;
 }
+/* 定格帧: 离开视口时冻结最后一帧, 回来无感知接续(重建期间也垫底, 不黑屏) */
+.tile .snap {
+  position: absolute; inset: 0; background: #000 no-repeat center / cover;
+  z-index: 2;
+}
 .tile .poster .big { font-size: 30px; opacity: .5; }
 .tile.no-signal video { display: none; }
 

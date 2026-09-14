@@ -99,6 +99,7 @@ function makeTile(d, lazy) {
   t.draggable = true;
   t.innerHTML = `
     <video muted playsinline preload="none"></video>
+    <div class="snap hidden"></div>
     <div class="poster hidden">
       <span class="big">${d.status === "auth_failed" ? "🔒" : "📡"}</span>
       <span>${d.status === "auth_failed" ? "凭据失败(需单独密码)" :
@@ -200,7 +201,40 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") resumeViewportStaggered();
 });
 
-// 离开视口: 保留热流15秒(滚动返回秒开), 超时未返回才销毁并释放后端转码
+// 抓取当前帧作为定格画面(离开视口后画面残留, 回来无感知接续)
+function captureFrame(tile) {
+  const video = tile.querySelector("video");
+  if (!video || video.videoWidth <= 0 || tile._snapUrl) return;
+  try {
+    const w = video.videoWidth, h = video.videoHeight;
+    const c = document.createElement("canvas");
+    c.width = Math.min(320, Math.round(w * 320 / Math.max(w, 1)));
+    c.height = Math.round(c.width * h / Math.max(w, 1));
+    c.getContext("2d").drawImage(video, 0, 0, c.width, c.height);
+    tile._snapUrl = c.toDataURL("image/jpeg", 0.55);
+    const snap = tile.querySelector(".snap");
+    if (snap) { snap.style.backgroundImage = `url(${tile._snapUrl})`; }
+  } catch (e) { /* 抓帧失败则无定格, 走原逻辑 */ }
+}
+
+function showSnap(tile) {
+  const snap = tile.querySelector(".snap");
+  if (snap && tile._snapUrl) snap.classList.remove("hidden");
+}
+
+function hideSnap(tile) {
+  const snap = tile.querySelector(".snap");
+  if (snap) snap.classList.add("hidden");
+}
+
+function setDot(tile, live) {
+  const dot = tile.querySelector(".dot");
+  if (!dot) return;
+  dot.classList.toggle("live", !!live);
+  dot.classList.toggle("dead", !live);
+}
+
+// 离开视口: 定格最后一帧 + 保留热流60秒(滚动返回秒开), 超时未返回才销毁并释放
 function detachStream(tile, immediate) {
   if (!tile._attached) return;
   tile._attached = false;
@@ -210,15 +244,17 @@ function detachStream(tile, immediate) {
   const h = state.hls.get(id);
   clearTimeout(tile._stallTimer);
   clearTimeout(tile._timeout);
+  captureFrame(tile);
   if (h && !h.destroyed && !immediate) {
     try { h.stopLoad(); } catch (e) {}
     try { video.pause(); } catch (e) {}
+    showSnap(tile);
     tile._releaseTimer = setTimeout(() => {
       const hh = state.hls.get(id);
       if (hh) { try { hh.destroy(); } catch (e) {} state.hls.delete(id); }
       if (video) { video.removeAttribute("src"); video.load(); }
       fetch(`/api/stream/release/${tile.dataset.ip}/${tile.dataset.ch}`, { method: "POST" }).catch(() => {});
-    }, 15000);
+    }, 60000);
   } else {
     if (h) { try { h.destroy(); } catch (e) {} state.hls.delete(id); }
     if (video) { video.removeAttribute("src"); video.load(); }
@@ -305,12 +341,20 @@ function attachStream(tile) {
   //  force=false (加载超时): 已有画面则直接恢复, 否则按退避重连(最多3次)
   const retryStream = (finalMsg, force) => {
     const rt = tile._retries || 0;
-    if (rt >= 3) { showPoster(finalMsg); return; }
-    if (!force && (video.videoWidth > 0 || video.readyState >= 2)) {
-      poster.classList.add("hidden");
+    if (rt >= 3) {
+      // 终态: 有定格帧则保持定格(不遮黑, 状态点变灰), 否则显示失败文案
+      if (tile._snapUrl) { showSnap(tile); setDot(tile, false); }
+      else showPoster(finalMsg);
       return;
     }
-    showPoster("加载中…自动重试");
+    if (!force && (video.videoWidth > 0 || video.readyState >= 2)) {
+      poster.classList.add("hidden");
+      hideSnap(tile);
+      return;
+    }
+    // 重试期间: 有定格帧就顶着(不闪"加载中"), 新画面出来才替换
+    if (tile._snapUrl) showSnap(tile);
+    else showPoster("加载中…自动重试");
     cleanup();
     const backoff = [2000, 5000, 10000][Math.min(rt, 2)];
     setTimeout(() => {
@@ -324,6 +368,7 @@ function attachStream(tile) {
   tile._timeout = setTimeout(() => {
     if (video.videoWidth > 0 || video.readyState > 0) {
       poster.classList.add("hidden");
+      hideSnap(tile);
       return;
     }
     retryStream("该路设备无响应，点击重试", false);
@@ -342,7 +387,7 @@ function attachStream(tile) {
     });
   };
 
-  // ===== 热流恢复: 刚离开视口(15秒内)保留的实例直接续播, 秒开 =====
+  // ===== 热流恢复: 刚离开视口(60秒内)保留的实例直接续播, 秒开 =====
   const kept = state.hls.get(id);
   if (kept && !kept.destroyed) {
     clearTimeout(tile._releaseTimer);
@@ -350,17 +395,22 @@ function attachStream(tile) {
     poster.classList.add("hidden");
     hls = kept;
     try { hls.startLoad(); } catch (e) { retryStream("该路设备无响应，点击重试", true); return; }
-    video.play().catch(() => {});
+    video.play().then(() => { hideSnap(tile); setDot(tile, true); }).catch(() => {});
     lastTime = video.currentTime || 0;
     stallWatch();
     return;
   }
+
+  // 重建期间: 有定格帧则垫底, 新画面出来才替换(全程不黑屏)
+  if (tile._snapUrl) showSnap(tile);
 
   if (Hls.isSupported() && !(isApple && canNative)) {
     hls = new Hls(HLS_CFG);
     state.hls.set(id, hls);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       poster.classList.add("hidden");
+      hideSnap(tile);
+      setDot(tile, true);
       video.play().catch(() => {});
       lastTime = video.currentTime || 0;
       stallWatch();
@@ -373,6 +423,8 @@ function attachStream(tile) {
     video.load();
     video.addEventListener("loadedmetadata", () => {
       poster.classList.add("hidden");
+      hideSnap(tile);
+      setDot(tile, true);
       video.play().catch(() => {});
       lastTime = video.currentTime || 0;
       stallWatch();
