@@ -178,6 +178,28 @@ function scheduleFallback() {
   attachTimer = setTimeout(() => { attachTimer = null; fallbackScan(); }, 150);
 }
 
+// 手机切回前台(锁屏/切App回来)时, 视口内未取流的通道错峰恢复,
+// 避免同时冲击设备RTSP会话(设备会话满会拒绝导致黑屏)
+function resumeViewportStaggered() {
+  const vh = window.innerHeight || document.documentElement.clientHeight;
+  const tiles = [...document.querySelectorAll("#grid .tile")].filter(t => {
+    if (!t._dev || t._attached || t.dataset.online !== "1") return false;
+    const r = t.getBoundingClientRect();
+    return r.bottom > -400 && r.top < vh + 400;
+  });
+  let i = 0;
+  const step = () => {
+    if (i >= tiles.length) return;
+    attachStream(tiles[i++]);
+    setTimeout(step, 700);   // 每700ms起一路, 14路约10秒铺满, 设备端可承受
+  };
+  if (tiles.length) step();
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resumeViewportStaggered();
+});
+
 // 离开视口: 保留热流15秒(滚动返回秒开), 超时未返回才销毁并释放后端转码
 function detachStream(tile, immediate) {
   if (!tile._attached) return;
@@ -278,17 +300,19 @@ function attachStream(tile) {
     poster.querySelector("span").textContent = msg;
   };
 
-  // 统一重试入口: 已有画面则直接恢复, 否则按退避重连(最多3次)
-  const retryStream = (finalMsg) => {
+  // 统一重试入口:
+  //  force=true (hls致命错误): 流已死, 无条件重连(videoWidth残留帧不能拦截)
+  //  force=false (加载超时): 已有画面则直接恢复, 否则按退避重连(最多3次)
+  const retryStream = (finalMsg, force) => {
     const rt = tile._retries || 0;
     if (rt >= 3) { showPoster(finalMsg); return; }
-    if (video.videoWidth > 0 || video.readyState >= 2) {
+    if (!force && (video.videoWidth > 0 || video.readyState >= 2)) {
       poster.classList.add("hidden");
       return;
     }
     showPoster("加载中…自动重试");
     cleanup();
-    const backoff = [2000, 4000, 8000][Math.min(rt, 2)];
+    const backoff = [2000, 5000, 10000][Math.min(rt, 2)];
     setTimeout(() => {
       tile._retries = (tile._retries || 0) + 1;
       tile._attached = false;   // 关键: 释放占用标记后才能真正重连
@@ -302,18 +326,18 @@ function attachStream(tile) {
       poster.classList.add("hidden");
       return;
     }
-    retryStream("该路设备无响应，点击重试");
+    retryStream("该路设备无响应，点击重试", false);
   }, 12000);
 
   const bindErrors = (h) => {
     h.on(Hls.Events.ERROR, (_, data) => {
       if (!data.fatal) return;
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        retryStream(failReason(data) + "，点击重试");
+        retryStream(failReason(data) + "，点击重试", true);
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-        try { h.recoverMediaError(); } catch (e) { retryStream(failReason(data) + "，点击重试"); }
+        try { h.recoverMediaError(); } catch (e) { retryStream(failReason(data) + "，点击重试", true); }
       } else {
-        retryStream(failReason(data) + "，点击重试");
+        retryStream(failReason(data) + "，点击重试", true);
       }
     });
   };
@@ -325,7 +349,7 @@ function attachStream(tile) {
     tile._releaseTimer = null;
     poster.classList.add("hidden");
     hls = kept;
-    try { hls.startLoad(); } catch (e) { failRetry(); return; }
+    try { hls.startLoad(); } catch (e) { retryStream("该路设备无响应，点击重试", true); return; }
     video.play().catch(() => {});
     lastTime = video.currentTime || 0;
     stallWatch();

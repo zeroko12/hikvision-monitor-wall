@@ -69,7 +69,7 @@ class StreamManager:
     - 空闲回收: last_hit 超过 IDLE_TIMEOUT 秒无请求 -> janitor 自动停流,
       浏览器离开视口后资源自动释放
     """
-    IDLE_TIMEOUT = 90          # 秒, 超过无任何取流请求则回收(前端滚动离开15秒后才释放, 此处兜底)
+    IDLE_TIMEOUT = 120         # 秒, 超过无任何取流请求则回收(前端滚动离开15秒后才释放, 此处兜底)
     START_TIMEOUT = 10         # 秒, ffmpeg 启动到产出 index.m3u8 的等待上限
     HEALTH_SEGMENTS = 2        # 启动后需在 HEALTH_TIMEOUT 内产出的最少分片数
     HEALTH_TIMEOUT = 12        # 秒, 达不到则判启动失败并回收
