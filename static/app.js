@@ -323,6 +323,10 @@ const HLS_CFG = {
   liveMaxLatencyDurationCount: 8,
   maxLiveSyncPlaybackRate: 1.5,
   startPosition: -2,
+  lowLatencyMode: true,          // 低延迟模式: 更激进的分片预取/缓冲调度
+  maxBufferLength: 8,            // 直播流缓冲上限8秒(默认30s), 更贴近实时、内存更省
+  maxMaxBufferLength: 12,        // 缓冲软上限(网络恢复追赶时也封顶12s)
+  backBufferLength: 5,           // 回看缓冲5s(热流恢复有MSE残留+新分片, 足够秒接)
   manifestLoadingTimeOut: 6000,
   levelLoadingTimeOut: 6000,
   fragLoadingTimeOut: 8000,

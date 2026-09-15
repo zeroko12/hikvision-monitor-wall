@@ -33,6 +33,9 @@ SNAP_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+# 静态资源/js/css与分片默认缓存24h(带版本号查询串, 分片URL唯一, 均安全);
+# 易变资源(index.html/manifest)在各自路由显式 no-store 覆盖
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 86400
 
 
 @app.after_request
@@ -121,19 +124,21 @@ class StreamManager:
                    "-analyzeduration", "0", "-probesize", "32k",
                    "-rtsp_transport", "tcp", "-timeout", "8000000", "-i", url]
             if quality == "main":
-                # 主码流: 软编保画质(单路点看用)
+                # 主码流: 软编保画质(单路点看用); -bf 0 关B帧降编码延迟
                 cmd += ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-                        "-crf", "26", "-g", str(fps), "-sc_threshold", "0",
+                        "-crf", "26", "-g", str(fps), "-sc_threshold", "0", "-bf", "0",
                         "-c:a", "aac", "-b:a", "24k", "-ac", "1", "-ar", "22050"]
             else:
                 # 子码流: QSV 硬编 + 降分辨率360p + 限帧10fps, 大幅降低CPU/功耗
+                # -bf 0: 关B帧, 编码延迟更低、缓冲更小(监控画面零画质损失)
                 cmd += ["-c:v", "h264_qsv", "-preset", "veryfast", "-look_ahead", "0",
                         "-b:v", "500k", "-maxrate", "700k", "-bufsize", "1000k",
                         "-r", "10", "-vf", "scale=-2:360", "-an",
-                        "-g", "10", "-sc_threshold", "0"]
+                        "-g", "10", "-sc_threshold", "0", "-bf", "0"]
             # 1s 分片 + 滑窗 6 片(约6秒) + temp_file(写完再改名, 避免半写文件被读到)
+            # independent_segments: 每分片独立可解(关键帧已对齐), 起播/切流更快
             cmd += ["-f", "hls", "-hls_time", "1", "-hls_list_size", "6",
-                    "-hls_flags", "delete_segments+temp_file",
+                    "-hls_flags", "delete_segments+temp_file+independent_segments",
                     "-hls_segment_filename", str(outdir / "seg_%05d.ts"),
                     str(outdir / "index.m3u8")]
             # 启动限流: 限制同时"正在拉起"的进程数(仅覆盖 Popen 阶段),
@@ -240,7 +245,9 @@ def do_refresh():
 # ---------- 页面与静态资源 ----------
 @app.get("/")
 def index():
-    return send_from_directory(BASE / "static", "index.html")
+    resp = send_from_directory(BASE / "static", "index.html")
+    resp.headers["Cache-Control"] = "no-store"   # 页面必须实时, 否则看不到版本更新
+    return resp
 
 
 # ---------- 设备 API ----------
@@ -282,27 +289,31 @@ def stream_playlist(ip, ch, quality):
     if not sm.start(ip, ch, quality):
         return jsonify({"error": "无法启动流(设备离线或凭据失败)"}), 502
     sm.touch(ip, ch, quality)
-    deadline = time.time() + sm.START_TIMEOUT
-    while time.time() < deadline:
-        if (outdir / "index.m3u8").exists():
-            break
-        proc = sm.procs.get(key)
-        if not proc or proc["proc"].poll() is not None:
-            sm.stop(ip, ch, quality)
-            return jsonify({"error": "ffmpeg退出(见logs目录日志)"}), 502
-        time.sleep(0.3)
-    if not (outdir / "index.m3u8").exists():
-        sm.stop(ip, ch, quality)
-        return jsonify({"error": "流启动超时"}), 504
-    # 健康检查: 启动后需在 HEALTH_TIMEOUT 内产出分片, 否则判失败(设备推流异常), 避免前端无限黑屏
+    # 仅对"5秒内新启动"的流做启动等待+健康检查;
+    # 复用已运行流直接放行(否则 started 时间戳过期 → 健康检查循环不执行 → 误杀正常流)
     started = (sm.procs.get(key) or {}).get("started", time.time())
-    while time.time() - started < sm.HEALTH_TIMEOUT:
-        if len(list(outdir.glob("seg_*.ts"))) >= sm.HEALTH_SEGMENTS:
-            break
-        time.sleep(0.3)
-    else:
-        sm.stop(ip, ch, quality)
-        return jsonify({"error": "流启动失败(设备未推流)"}), 502
+    fresh = time.time() - started < 5
+    if fresh:
+        deadline = time.time() + sm.START_TIMEOUT
+        while time.time() < deadline:
+            if (outdir / "index.m3u8").exists():
+                break
+            proc = sm.procs.get(key)
+            if not proc or proc["proc"].poll() is not None:
+                sm.stop(ip, ch, quality)
+                return jsonify({"error": "ffmpeg退出(见logs目录日志)"}), 502
+            time.sleep(0.3)
+        if not (outdir / "index.m3u8").exists():
+            sm.stop(ip, ch, quality)
+            return jsonify({"error": "流启动超时"}), 504
+        # 健康检查: 启动后需在 HEALTH_TIMEOUT 内产出分片, 否则判失败(设备推流异常), 避免前端无限黑屏
+        while time.time() - started < sm.HEALTH_TIMEOUT:
+            if len(list(outdir.glob("seg_*.ts"))) >= sm.HEALTH_SEGMENTS:
+                break
+            time.sleep(0.3)
+        else:
+            sm.stop(ip, ch, quality)
+            return jsonify({"error": "流启动失败(设备未推流)"}), 502
     playlist = outdir / "index.m3u8"
     content = None
     for _ in range(20):
@@ -362,8 +373,10 @@ def stream_file(ip, ch, quality, filename):
         if not (outdir / "index.m3u8").exists():
             sm.stop(ip, ch, quality)
             return jsonify({"error": "流启动超时"}), 504
-        return send_from_directory(outdir, filename,
+        resp = send_from_directory(outdir, filename,
                                    mimetype="application/vnd.apple.mpegurl")
+        resp.headers["Cache-Control"] = "no-store"   # 播放列表必须实时
+        return resp
     if filename.endswith(".ts"):
         try:
             return send_from_directory(outdir, filename, mimetype="video/mp2t")
